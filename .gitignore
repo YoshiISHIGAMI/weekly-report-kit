@@ -1,0 +1,10 @@
+# data & reports
+data/
+data/notion-export/
+data/toggl/
+reports/
+
+# OS/Editor
+.DS_Store
+.vscode/
+.idea/
