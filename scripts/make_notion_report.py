@@ -2,56 +2,53 @@
 # -*- coding: utf-8 -*-
 
 """
-Notionエクスポート(.md群)から、指定期間の「日次原文まとめ」を作るスクリプト。
-- 各日の H1（あれば原文のまま）を出力
-- 指定のH2セクション群を原文のまま抜き出して結合
-- 期間指定は --since/--until か、週次指定 --week-start (土曜開始→金曜締め) が使えます
+Notionエクスポート(.md群)から「日記本文をそのまま束ねた」レポートを作成。
 
-使い方例:
-  # 週次（2025-11-08(土)〜2025-11-14(金)）をまとめて weekly.md に
-  python3 make_notion_report.py \
-    --src ./notion-export \
-    --bundle-out ./weekly.md \
-    --week-start 2025-11-08
+フォーマット（1エントリ）:
+# YYYY年M月D日                         ← 解析した日付を必ずH1で出す
+## <元のH1タイトルそのまま>            ← 元のH1はH2へ変換して出す（“そのまま”）
+### 🧪 習慣ログ                         ← 対象H2はH3にして本文を“そのまま”連結
+…（本文そのまま／「日付: …」行は除去）
 
-  # 任意の期間でまとめ
-  python3 make_notion_report.py \
-    --src ./notion-export \
-    --bundle-out ./range.md \
-    --since 2025-11-08 --until 2025-11-14
+仕様:
+- 期間フィルタなし（data/ 側で対象週だけ配置する運用）
+- 対象セクションは以下のH2のみを抽出（出現順を保持して出力）
+    - 🧪 習慣ログ
+    - ☀️ 今日の実践（括弧の有無に寛容）
+    - ✨ ひらめき
+    - 🧠 新たな学び・気づき・共感
+    - 🚧 振返り・分析・改善点（「振り返り」「振返り」表記ゆれ対応）
+- 本文中の「日付: YYYY年M月D日」行はノイズとして出力しない
 """
 
 import argparse
 import re
 from pathlib import Path
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import date
+from typing import List, Optional, Tuple
 
 NBSP = "\u00A0"
 
-# 取り込み対象のH2見出し（含まれていればOK）
+# 対象H2の見出し判定用キー（含まれていればOK／表記ゆれケア）
 H2_KEYS = [
     "🧪 習慣ログ",
-    "☀️ 今日の実践",  # （行動ログ・実践ログ）等の括弧有無は問わない
+    "☀️ 今日の実践",
     "✨ ひらめき",
     "🧠 新たな学び・気づき・共感",
-    "🚧 振返り・分析・改善点",  # 「振り返り」「振返り」両表記ケアは下の判定で
+    "🚧 振返り・分析・改善点",
 ]
 
-# 日付パターン（H1 or "日付: ..."）
+# 日付の抽出（H1に含まれる場合 or 「日付: …」行）
 RE_H1_DATE = re.compile(r"^\s*#\s*(\d{4})年(\d{1,2})月(\d{1,2})日")
 RE_LINE_DATE = re.compile(r"^\s*日付\s*[:：]\s*(\d{4})年(\d{1,2})月(\d{1,2})日")
 
-def normalize(s: str) -> str:
-    """判定用にNBSP→spaceへ。"""
+def norm(s: str) -> str:
+    """NBSPを通常のスペースに置換。"""
     return s.replace(NBSP, " ")
 
 def parse_date_from_line(line: str) -> Optional[date]:
-    """H1/日付行から和暦yyyy年m月d日を抽出して date を返す。"""
-    s = normalize(line).strip()
-    m = RE_H1_DATE.match(s)
-    if not m:
-        m = RE_LINE_DATE.match(s)
+    s = norm(line).strip()
+    m = RE_H1_DATE.match(s) or RE_LINE_DATE.match(s)
     if not m:
         return None
     y, mo, d = map(int, m.groups())
@@ -62,72 +59,64 @@ def walk_md_files(src: Path) -> List[Path]:
         return [src]
     return sorted([p for p in src.rglob("*.md") if p.is_file()])
 
-def within_range(d: date, since: Optional[date], until: Optional[date]) -> bool:
-    if since and d < since:
-        return False
-    if until and d > until:
-        return False
-    return True
-
-def is_target_h2(h2_line: str) -> bool:
-    """対象H2かどうかを緩めに判定（NBSP除去・空白詰め・表記ゆれ対応）。"""
-    s = re.sub(r"\s+", " ", normalize(h2_line.strip()))
+def match_target_h2(h2_line: str) -> bool:
+    """対象H2かを緩く判定（NBSP除去・空白正規化・表記ゆれ対応）。"""
+    s = re.sub(r"\s+", " ", norm(h2_line.strip()))
     if not s.startswith("##"):
         return False
-    s = s[2:].strip()  # "##"を削除
-    # 表記ゆれ: 「振り返り」「振返り」を統一判定
-    if "振り返り" in s:
-        s = s.replace("振り返り", "振返り")
-    # キーのいずれかを含めばOK
+    title = s[2:].strip()
+    title = title.replace("振り返り", "振返り")  # ゆれ吸収
     for key in H2_KEYS:
-        k = key
-        if "振り返り" in k:
-            k = k.replace("振り返り", "振返り")
-        if k in s:
+        k = key.replace("振り返り", "振返り")
+        if k in title:
             return True
     return False
 
-def extract_sections(lines: List[str]) -> Tuple[Optional[str], Optional[date], List[Tuple[str, List[str]]]]:
-    """
-    1ファイルぶんを解析:
-      - H1（原文）: 最初に見つけたH1を返す（なければNone）
-      - 日付: H1/「日付:」のいずれかから取得（なければNone）
-      - 対象H2セクション: (見出し行, 本文行[]) のリスト
-    """
-    h1_line: Optional[str] = None
-    found_date: Optional[date] = None
+def h1_to_title_text(h1_line: str) -> str:
+    """H1行から '# ' を外して素のタイトル文字列に。"""
+    return re.sub(r"^\s*#\s*", "", h1_line.strip())
 
-    # H1/日付行を拾う（上から順）
+def h2_to_h3(head_line: str) -> str:
+    """H2見出しをH3へ変換（本文テキストはそのまま）。"""
+    text = re.sub(r"^\s*##\s*", "", head_line.strip())
+    return f"### {text}"
+
+def extract_entry(lines: List[str]) -> Tuple[Optional[str], Optional[date], List[Tuple[str, List[str]]]]:
+    """
+    1ファイル分を解析して返す:
+      - title_h1: 元のH1行（文字列／先頭の`#`付き）。無ければ None
+      - d: 解析した日付（H1/「日付:」から）
+      - sections: 対象H2のみ、出現順に [(見出し行, 本文行[])] で返す
+                  本文中の「日付: …」行は除去
+    """
+    title_h1: Optional[str] = None
+    d: Optional[date] = None
+
+    # タイトルと日付を拾う（上から順に）
     for ln in lines:
-        if h1_line is None and normalize(ln).strip().startswith("# "):
-            h1_line = ln.rstrip("\n")
-            # H1側に日付が含まれていればそれで確定
+        if title_h1 is None and norm(ln).strip().startswith("# "):
+            title_h1 = ln.rstrip("\n")
+            d = d or parse_date_from_line(ln)
+        if d is None:
             d = parse_date_from_line(ln)
-            if d:
-                found_date = d
-        # 「日付:」行
-        if found_date is None:
-            d2 = parse_date_from_line(ln)
-            if d2:
-                found_date = d2
 
-    # 対象H2をブロック抽出
+    # 対象H2セクションを、見つけた順に抽出
     sections: List[Tuple[str, List[str]]] = []
-    i = 0
-    N = len(lines)
+    i, N = 0, len(lines)
     while i < N:
         line = lines[i]
-        if normalize(line).startswith("## ") and is_target_h2(line):
+        if norm(line).startswith("## ") and match_target_h2(line):
             head = line.rstrip("\n")
             j = i + 1
             chunk: List[str] = []
-            # 次のH2/H1/新しい「日付:」が来るまでを本文として回収
             while j < N:
                 nxt = lines[j]
-                if normalize(nxt).startswith("## ") or normalize(nxt).startswith("# "):
+                if norm(nxt).startswith("## ") or norm(nxt).startswith("# "):
                     break
-                if RE_LINE_DATE.match(normalize(nxt)):
-                    break
+                # 「日付:」行は本文としては除外
+                if RE_LINE_DATE.match(norm(nxt)):
+                    j += 1
+                    continue
                 chunk.append(nxt.rstrip("\n"))
                 j += 1
             sections.append((head, chunk))
@@ -135,105 +124,55 @@ def extract_sections(lines: List[str]) -> Tuple[Optional[str], Optional[date], L
         else:
             i += 1
 
-    return h1_line, found_date, sections
-
-def iso(d: date) -> str:
-    return d.isoformat()
-
-def build_week_range_from_saturday(week_start: date) -> Tuple[date, date]:
-    """土曜始まり→金曜締めの1週間 [start, end] を返す。"""
-    # week_start が土曜であることの強制はしない（任意日でもそこを起点に7日間）
-    end = week_start + timedelta(days=6)
-    return week_start, end
+    return title_h1, d, sections
 
 def main():
-    ap = argparse.ArgumentParser(description="Notion日記(.md)から期間内の原文まとめMDを生成")
+    ap = argparse.ArgumentParser(description="Notion日記(.md)を日付順で束ねる（期間フィルタなし）")
     ap.add_argument("--src", required=True, help="Notionエクスポートのフォルダ or .mdファイル")
-    ap.add_argument("--bundle-out", required=True, help="まとめMarkdownを書き出すパス")
-    ap.add_argument("--since", help="開始日 YYYY-MM-DD（含む）")
-    ap.add_argument("--until", help="終了日 YYYY-MM-DD（含む）")
-    ap.add_argument("--week-start", help="この日付から1週間(土→金)を対象にする YYYY-MM-DD")
+    ap.add_argument("--bundle-out", required=True, help="まとめMarkdownの出力先")
     args = ap.parse_args()
 
     src = Path(args.src).expanduser()
-    out_path = Path(args.bundle_out).expanduser()
-
-    # 期間解決
-    since: Optional[date] = None
-    until: Optional[date] = None
-    if args.week_start:
-        ws = datetime.strptime(args.week_start, "%Y-%m-%d").date()
-        since, until = build_week_range_from_saturday(ws)
-    else:
-        if args.since:
-            since = datetime.strptime(args.since, "%Y-%m-%d").date()
-        if args.until:
-            until = datetime.strptime(args.until, "%Y-%m-%d").date()
-
     files = walk_md_files(src)
-    by_date: Dict[date, List[Tuple[Optional[str], List[Tuple[str, List[str]]]]]] = {}
 
+    # (date, title_h1, sections[]) を集める
+    entries: List[Tuple[date, Optional[str], List[Tuple[str, List[str]]]]] = []
     for fp in files:
         text = fp.read_text(encoding="utf-8", errors="ignore")
-        # 行単位（末尾の改行はstripせず保持しつつ、扱いやすいようrstripで都度落とす）
         lines = text.splitlines(keepends=True)
-        h1, d, sections = extract_sections(lines)
+        title_h1, d, sections = extract_entry(lines)
         if not d:
-            # 日付が取れないノートはスキップ（必要なら拾う仕様にも変更可）
-            continue
-        if not within_range(d, since, until):
-            continue
-        by_date.setdefault(d, []).append((h1, sections))
+            continue  # 日付が取れないノートはスキップ
+        entries.append((d, title_h1, sections))
 
-    # 日付昇順に並べ、同日内は発見順（ファイル名順）で
+    # 日付昇順に整列
+    entries.sort(key=lambda x: x[0])
+
     out_lines: List[str] = []
-    dates_sorted = sorted(by_date.keys())
-    for d in dates_sorted:
-        items = by_date[d]
-        for h1, sections in items:
-            # 見出し
-            if h1 and normalize(h1).strip().startswith("# "):
-                out_lines.append(h1.strip())
-                out_lines.append("")  # 空行
-            else:
-                # H1が無い場合は日付だけのH1を生成
-                ymd = f"{d.year}年{d.month}月{d.day}日"
-                out_lines.append(f"# {ymd}")
-                out_lines.append("")
+    for d, title_h1, sections in entries:
+        # 1) 常に 日付H1 を先頭に出力
+        out_lines.append(f"# {d.year}年{d.month}月{d.day}日")
+        out_lines.append("")
 
-            # 対象セクションを、定義順(H2_KEYS)で並び替えて出力（元の見出し文字列は原文のまま）
-            # まず見出しテキスト→ブロックを辞書化（キーは緩めに正規化）
-            bucket: Dict[str, List[Tuple[str, List[str]]]] = {k: [] for k in H2_KEYS}
-
-            def normalize_h2_key(h2: str) -> Optional[str]:
-                s = re.sub(r"\s+", " ", normalize(h2.strip()))
-                s = s[2:].strip()  # drop "##"
-                s = s.replace("振り返り", "振返り")
-                for k in H2_KEYS:
-                    kk = k.replace("振り返り", "振返り")
-                    if kk in s:
-                        return k
-                return None
-
-            for head, body in sections:
-                key = normalize_h2_key(head)
-                if key:
-                    bucket[key].append((head, body))
-
-            # 定義順に出力。複数あればそのまま連結
-            for key in H2_KEYS:
-                blocks = bucket.get(key, [])
-                for head, body in blocks:
-                    out_lines.append(head)
-                    out_lines.extend(body)
-                    out_lines.append("")  # セクション間の空行
-
-            # 日ごとの区切り
+        # 2) 元のH1タイトルは H2 として“そのまま”出力（# を ## に変換）
+        if title_h1:
+            title_text = h1_to_title_text(title_h1)
+            out_lines.append(f"## {title_text}")
             out_lines.append("")
 
-    # 書き出し
+        # 3) 対象H2は H3 に降格し、本文は“そのまま”出力（出現順）
+        for head, body in sections:
+            out_lines.append(h2_to_h3(head))
+            out_lines.extend(body)
+            out_lines.append("")  # セクション間の空行
+
+        # エントリ間の空行
+        out_lines.append("")
+
+    out_path = Path(args.bundle_out).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
-    print(f"✅ Wrote: {out_path}  ({sum(len(v) for v in by_date.values())} entries)")
-    if since or until:
-        print(f"   Range: {since or '-'} .. {until or '-'}")
+    print(f"✅ Wrote: {out_path}  ({len(entries)} entries)")
+
+if __name__ == "__main__":
+    main()
